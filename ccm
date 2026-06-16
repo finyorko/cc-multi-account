@@ -1,0 +1,412 @@
+#!/bin/bash
+# ccm — manage multiple Claude Code accounts / backends on one machine
+#
+# Subcommands:
+#   ccm add-official [name]     add an official-account command (OAuth), isolated config dir, shared sessions
+#   ccm add-proxy    [name]     add a third-party backend command (base_url + key + 3 model tiers)
+#   ccm login        <name>     run that command to do OAuth login (official accounts)
+#   ccm list                    list all ccm-managed commands
+#   ccm delete       <name>     delete a command (sessions are kept)
+#   ccm rename       <old> <new> rename a command
+#
+# No separate registry: each generated wrapper carries a `# ccm-managed:` marker,
+# so the filesystem itself is the source of truth. Mutable endpoints/keys live in
+# external env files and take effect immediately.
+
+set -u
+
+BIN_DIR="$HOME/.local/bin"
+ACCT_ROOT="$HOME/.claude-accounts"
+BACKEND_DIR="$HOME/.config/ccm/backends"
+BASE_DIR="$HOME/.claude"                 # primary account config dir (command `claude`, not managed by ccm)
+PRIVATE_ITEMS=".credentials.json .claude.json"   # account identity/secrets, never symlinked
+
+c_bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+c_red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+c_grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+c_ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+c_dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
+die()    { c_red "Error: $*" >&2; exit 1; }
+
+ASSUME_YES=0
+# Confirmation prompt: -y passes automatically; otherwise read /dev/tty, falling back
+# to stdin when there is no tty (so `echo y | ...` works).
+confirm() {
+  [ "$ASSUME_YES" = 1 ] && return 0
+  printf '%s [y/N]: ' "$1"
+  yn=""
+  if [ -r /dev/tty ]; then read -r yn </dev/tty 2>/dev/null || yn=""; else read -r yn 2>/dev/null || yn=""; fi
+  case "$yn" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+# Read one value interactively (fall back to stdin when no tty)
+ask() {  # ask PROMPT  -> result in global REPLY_VAL
+  printf '%s' "$1"; REPLY_VAL=""
+  if [ -r /dev/tty ]; then read -r REPLY_VAL </dev/tty 2>/dev/null || REPLY_VAL=""; else read -r REPLY_VAL 2>/dev/null || REPLY_VAL=""; fi
+}
+
+# ── validate command name ────────────────────────────────────
+validate_name() {
+  name="$1"
+  case "$name" in
+    ""|*[!a-zA-Z0-9._-]*) die "Invalid command name (only letters, digits, . _ -): $name" ;;
+    claude) die "Cannot use 'claude' (conflicts with the built-in command)" ;;
+  esac
+  if [ -e "$BIN_DIR/$name" ]; then
+    die "Command already exists: $BIN_DIR/$name (use ccm delete / rename)"
+  fi
+  existing="$(command -v "$name" 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    die "Name '$name' is already taken by a command on PATH: $existing"
+  fi
+}
+
+# ── suggest default name: claude-b, claude-c, ... (primary claude = A) ──
+# Alphabetic odometer: first char b..z (skip a = built-in claude), rest a..z;
+# grows in length as needed. Sequence: b c … z  ba bb … bz  ca … zz  baa …
+next_char() { n=$(printf '%d' "'$1"); printf "\\$(printf '%03o' $((n+1)))"; }  # a→b … y→z
+next_alpha() {
+  s="$1"; len=${#s}; i=$((len-1))
+  while [ "$i" -ge 0 ]; do
+    ch="${s:$i:1}"
+    if [ "$i" -eq 0 ]; then
+      if [ "$ch" != z ]; then printf '%s%s' "$(next_char "$ch")" "${s:1}"; return
+      else j=0; printf 'b'; while [ "$j" -lt "$len" ]; do printf a; j=$((j+1)); done; return; fi
+    else
+      if [ "$ch" != z ]; then printf '%s%s%s' "${s:0:$i}" "$(next_char "$ch")" "${s:$((i+1))}"; return
+      else s="${s:0:$i}a${s:$((i+1))}"; i=$((i-1)); fi
+    fi
+  done
+}
+suggest_official_name() {
+  s="b"
+  while :; do
+    cand="claude-$s"
+    if [ ! -e "$BIN_DIR/$cand" ] && ! command -v "$cand" >/dev/null 2>&1; then
+      echo "$cand"; return
+    fi
+    s="$(next_alpha "$s")"
+  done
+}
+suggest_proxy_name() {
+  i=1
+  while :; do
+    cand="claude-proxy$i"
+    if [ ! -e "$BIN_DIR/$cand" ] && ! command -v "$cand" >/dev/null 2>&1; then
+      echo "$cand"; return
+    fi
+    i=$((i+1))
+  done
+}
+
+# ── write official-account wrapper ───────────────────────────
+write_official_wrapper() {
+  name="$1"; cfgdir="$2"
+  cat > "$BIN_DIR/$name" <<EOF
+#!/bin/bash
+# ccm-managed: official
+# config dir: $cfgdir
+unset CLAUDE_CODE_CHILD_SESSION
+export CLAUDE_CONFIG_DIR="$cfgdir"
+exec claude "\$@"
+EOF
+  chmod +x "$BIN_DIR/$name"
+}
+
+# ── write proxy-backend wrapper ──────────────────────────────
+write_proxy_wrapper() {
+  name="$1"; envfile="$2"
+  cat > "$BIN_DIR/$name" <<EOF
+#!/bin/bash
+# ccm-managed: proxy
+# backend config: $envfile
+unset CLAUDE_CODE_CHILD_SESSION
+envfile="$envfile"
+[ -r "\$envfile" ] || { echo "ccm: backend config not readable: \$envfile" >&2; exit 1; }
+. "\$envfile"
+export ANTHROPIC_BASE_URL="\$base_url"
+if [ "\${auth_style:-token}" = "api-key" ]; then
+  export ANTHROPIC_API_KEY="\$key"
+else
+  export ANTHROPIC_AUTH_TOKEN="\$key"
+fi
+export ANTHROPIC_MODEL="\$opus"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="\$opus"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="\$sonnet"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="\$haiku"
+export API_TIMEOUT_MS="1200000"
+export CLAUDE_CODE_API_KEY_HELPER_TTL_MS="0"
+if [ "\${early_compact:-0}" = "1" ]; then
+  export CLAUDE_CODE_AUTO_COMPACT_WINDOW="220000"
+  export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="60"
+  export CLAUDE_CODE_MAX_OUTPUT_TOKENS="12000"
+fi
+exec claude "\$@"
+EOF
+  chmod +x "$BIN_DIR/$name"
+}
+
+# ── resolve a wrapper's associated storage (rename-safe: never assume name==storage) ──
+# Marker is fixed on line 2 (line 1 is the shebang), to avoid matching ccm's own source.
+wrapper_type()    { sed -n '2s/^# ccm-managed: //p' "$1" 2>/dev/null; }
+wrapper_cfgdir()  { sed -n 's/^export CLAUDE_CONFIG_DIR="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -1; }
+wrapper_envfile() { sed -n 's/^envfile="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -1; }
+
+# Extract a string field from .claude.json (tolerate spaces after the colon;
+# Claude Code writes pretty-printed JSON).
+json_str() {  # json_str FILE KEY
+  [ -f "$1" ] || return 0
+  grep -oE "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed -E 's/.*:[[:space:]]*"//; s/"$//'
+}
+org_label() {
+  case "$1" in
+    claude_max) echo "Max" ;;
+    claude_team) echo "Team" ;;
+    claude_pro) echo "Pro" ;;
+    claude_enterprise) echo "Enterprise" ;;
+    "") echo "" ;;
+    *) echo "$1" ;;
+  esac
+}
+# Build a display string from an account's state file: email (display name) · type
+acct_label() {  # acct_label STATE_FILE
+  email="$(json_str "$1" emailAddress)"
+  [ -z "$email" ] && { echo "(not logged in)"; return; }
+  disp="$(json_str "$1" displayName)"
+  otype="$(org_label "$(json_str "$1" organizationType)")"
+  out="$email"
+  [ -n "$disp" ] && out="$out ($disp)"
+  [ -n "$otype" ] && out="$out · $otype"
+  echo "$out"
+}
+
+# ── add-official ─────────────────────────────────────────────
+cmd_add_official() {
+  name="${1:-}"
+  if [ -z "$name" ]; then
+    def="$(suggest_official_name)"
+    ask "Command name for the new official account [default: $def]: "; name="$REPLY_VAL"
+    [ -z "$name" ] && name="$def"
+  fi
+  validate_name "$name"
+  [ -d "$BASE_DIR" ] || die "Primary config dir not found: $BASE_DIR (run claude normally once first)"
+
+  cfgdir="$ACCT_ROOT/$name"
+  mkdir -p "$cfgdir"; chmod 700 "$cfgdir"
+
+  # Symlink every item under ~/.claude except identity/secrets (shared sessions & config)
+  linked=0
+  for path in "$BASE_DIR"/* "$BASE_DIR"/.[!.]*; do
+    [ -e "$path" ] || continue
+    item="$(basename "$path")"
+    skip=0
+    for p in $PRIVATE_ITEMS; do [ "$item" = "$p" ] && skip=1; done
+    [ "$skip" = 1 ] && continue
+    [ -e "$cfgdir/$item" ] && continue
+    ln -s "$BASE_DIR/$item" "$cfgdir/$item" && linked=$((linked+1))
+  done
+
+  write_official_wrapper "$name" "$cfgdir"
+
+  c_grn "✓ Created official-account command: $name"
+  c_dim "  Config dir: $cfgdir (credentials private; linked $linked shared items back to $BASE_DIR)"
+  echo
+  echo "Next, log in (either):"
+  echo "  ccm login $name        # or just run: $name  then  /login inside"
+}
+
+# ── login ────────────────────────────────────────────────────
+cmd_login() {
+  name="${1:-}"; [ -n "$name" ] || die "Usage: ccm login <name>"
+  [ -x "$BIN_DIR/$name" ] || die "Command not found: $name"
+  c_dim "Launching $name for OAuth login. After login, run /status to verify the account, then /exit."
+  exec "$BIN_DIR/$name"
+}
+
+# ── add-proxy ────────────────────────────────────────────────
+cmd_add_proxy() {
+  name=""; base_url=""; key=""; opus=""; sonnet=""; haiku=""
+  auth_style="token"; early_compact="0"; no_probe="0"
+  # parse flags; the first non-`--` argument is the name
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base-url) base_url="$2"; shift 2 ;;
+      --key)      key="$2"; shift 2 ;;
+      --opus)     opus="$2"; shift 2 ;;
+      --sonnet)   sonnet="$2"; shift 2 ;;
+      --haiku)    haiku="$2"; shift 2 ;;
+      --api-key-style) auth_style="api-key"; shift ;;
+      --early-compact) early_compact="1"; shift ;;
+      --no-probe) no_probe="1"; shift ;;
+      --*) die "Unknown option: $1" ;;
+      *) [ -z "$name" ] && name="$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$name" ]; then
+    def="$(suggest_proxy_name)"
+    ask "Command name [default: $def]: "; name="$REPLY_VAL"; [ -z "$name" ] && name="$def"
+  fi
+  validate_name "$name"
+
+  [ -z "$base_url" ] && { ask "base_url (no /v1, e.g. https://host:port): "; base_url="$REPLY_VAL"; }
+  [ -z "$key" ]      && { ask "API key: "; key="$REPLY_VAL"; }
+  [ -z "$opus" ]     && { ask "opus-tier model name: "; opus="$REPLY_VAL"; }
+  [ -z "$sonnet" ]   && { ask "sonnet-tier model name [default: same as opus]: "; sonnet="$REPLY_VAL"; [ -z "$sonnet" ] && sonnet="$opus"; }
+  [ -z "$haiku" ]    && { ask "haiku-tier model name (background / subagent light tasks) [default: same as sonnet]: "; haiku="$REPLY_VAL"; [ -z "$haiku" ] && haiku="$sonnet"; }
+  [ -n "$base_url" ] && [ -n "$key" ] && [ -n "$opus" ] || die "base_url / key / opus must not be empty"
+
+  if [ "$no_probe" = "0" ]; then
+    c_dim "Probing $base_url/v1/messages with a minimal request (model $opus)..."
+    body="{\"model\":\"$opus\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+    if [ "$auth_style" = "api-key" ]; then authhdr=(-H "x-api-key: $key"); else authhdr=(-H "Authorization: Bearer $key"); fi
+    resp="$(curl -sS -m 30 "$base_url/v1/messages" \
+      "${authhdr[@]}" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+      -d "$body" 2>&1)"
+    if printf '%s' "$resp" | grep -q '"type":[[:space:]]*"message"'; then
+      c_grn "✓ Probe OK: backend speaks the Anthropic protocol; key and model $opus work"
+    elif printf '%s' "$resp" | grep -q '"content"'; then
+      c_grn "✓ Probe OK (response contains content)"
+    else
+      c_ylw "✗ Probe failed, backend returned:"
+      printf '%s\n' "$resp" | head -c 500; echo
+      confirm "Save anyway?" || die "Cancelled"
+    fi
+  fi
+
+  mkdir -p "$BACKEND_DIR"
+  envfile="$BACKEND_DIR/$name.env"
+  umask 077
+  cat > "$envfile" <<EOF
+base_url="$base_url"
+key="$key"
+opus="$opus"
+sonnet="$sonnet"
+haiku="$haiku"
+auth_style="$auth_style"
+early_compact="$early_compact"
+EOF
+  chmod 600 "$envfile"
+  write_proxy_wrapper "$name" "$envfile"
+
+  c_grn "✓ Created proxy command: $name"
+  c_dim "  $base_url  | opus=$opus sonnet=$sonnet haiku=$haiku  | config: $envfile"
+  echo "Ready to use: $name"
+}
+
+# ── list ─────────────────────────────────────────────────────
+cmd_list() {
+  # Count first (built-in claude counts as 1 official account)
+  n_official=1; n_proxy=0
+  for w in "$BIN_DIR"/*; do
+    [ -f "$w" ] || continue
+    [ "$(basename "$w")" = "ccm" ] && continue
+    t="$(wrapper_type "$w")"; [ -n "$t" ] || continue
+    if [ "$t" = "official" ]; then n_official=$((n_official+1)); else n_proxy=$((n_proxy+1)); fi
+  done
+  total=$((n_official + n_proxy))
+
+  c_bold "Claude Code commands — $total total (official $n_official · proxy $n_proxy)"
+  echo
+
+  i=1
+  # [1] built-in default account: command `claude`, state file at ~/.claude.json (legacy location)
+  primary_sf="$HOME/.claude.json"; [ -f "$primary_sf" ] || primary_sf="$BASE_DIR/.claude.json"
+  printf "  [%d] \033[36;1m%-15s\033[0m official · default\n" "$i" "claude"
+  printf "      %-8s%s\n" "account" "$(acct_label "$primary_sf")"
+  printf "      \033[2m%-8s%s\033[0m\n" "dir" "$BASE_DIR"
+  i=$((i+1))
+
+  for w in "$BIN_DIR"/*; do
+    [ -f "$w" ] || continue
+    [ "$(basename "$w")" = "ccm" ] && continue
+    t="$(wrapper_type "$w")"; [ -n "$t" ] || continue
+    name="$(basename "$w")"
+    echo
+    if [ "$t" = "official" ]; then
+      cfg="$(wrapper_cfgdir "$w")"
+      printf "  [%d] \033[36;1m%-15s\033[0m official\n" "$i" "$name"
+      printf "      %-8s%s\n" "account" "$(acct_label "$cfg/.claude.json")"
+      printf "      \033[2m%-8s%s\033[0m\n" "dir" "$cfg"
+    else
+      ef="$(wrapper_envfile "$w")"; base_url=""; opus=""; sonnet=""; haiku=""
+      [ -r "$ef" ] && . "$ef"
+      printf "  [%d] \033[36;1m%-15s\033[0m proxy\n" "$i" "$name"
+      printf "      %-8s%s\n" "backend" "$base_url"
+      printf "      \033[2m%-8s%s\033[0m\n" "models" "opus=$opus  sonnet=$sonnet  haiku=$haiku"
+    fi
+    i=$((i+1))
+  done
+  return 0
+}
+
+# ── delete ───────────────────────────────────────────────────
+cmd_delete() {
+  name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in -y|--yes) ASSUME_YES=1; shift ;; *) [ -z "$name" ] && name="$1"; shift ;; esac
+  done
+  [ -n "$name" ] || die "Usage: ccm delete [-y] <name>"
+  w="$BIN_DIR/$name"
+  [ -f "$w" ] && [ -n "$(wrapper_type "$w")" ] || die "$name is not a ccm-managed command"
+  t="$(wrapper_type "$w")"
+  if [ "$t" = "official" ]; then
+    cfg="$(wrapper_cfgdir "$w")"
+    c_ylw "About to delete official-account command $name and its config dir:"
+    c_dim "  $cfg (contains this account's credentials; sessions are shared data symlinked to $BASE_DIR and will NOT be deleted)"
+    confirm "Delete?" || die "Cancelled"
+    rm -f "$w"; [ -n "$cfg" ] && rm -rf "$cfg"
+    c_grn "✓ Deleted $name (clean up stored credentials manually if needed)"
+  else
+    ef="$(wrapper_envfile "$w")"
+    confirm "Delete proxy command $name and its config $ef?" || die "Cancelled"
+    rm -f "$w"; [ -n "$ef" ] && rm -f "$ef"
+    c_grn "✓ Deleted $name"
+  fi
+}
+
+# ── rename ───────────────────────────────────────────────────
+cmd_rename() {
+  old="${1:-}"; new="${2:-}"; [ -n "$old" ] && [ -n "$new" ] || die "Usage: ccm rename <old> <new>"
+  w="$BIN_DIR/$old"
+  [ -f "$w" ] && [ -n "$(wrapper_type "$w")" ] || die "$old is not a ccm-managed command"
+  validate_name "$new"
+  mv "$w" "$BIN_DIR/$new"; chmod +x "$BIN_DIR/$new"
+  c_grn "✓ Renamed: $old → $new"
+  c_dim "  (underlying storage path unchanged; references intact)"
+}
+
+usage() {
+  cat <<'EOF'
+ccm — manage multiple Claude Code accounts / backends
+
+Usage:
+  ccm add-official [name]                 add an official-account command (OAuth); prompts & suggests a default if no name
+  ccm add-proxy    [name] [options]       add a third-party backend command
+      options: --base-url URL --key KEY --opus M --sonnet M --haiku M
+               --api-key-style (use x-api-key instead of Bearer) --early-compact --no-probe
+  ccm login   <name>                      run that command to do OAuth login
+  ccm list                                list all managed commands
+  ccm delete  [-y] <name>                 delete a command (sessions are kept)
+  ccm rename  <old> <new>                 rename a command
+
+Notes: commands are generated in ~/.local/bin/; backend params live in
+       ~/.config/ccm/backends/<name>.env (effective immediately); official-account
+       config dirs live in ~/.claude-accounts/<name>/ with credentials private and
+       sessions shared via symlinks.
+EOF
+}
+
+main() {
+  cmd="${1:-}"; [ $# -gt 0 ] && shift
+  case "$cmd" in
+    add-official|addofficial|official) cmd_add_official "$@" ;;
+    add-proxy|addproxy|proxy)          cmd_add_proxy "$@" ;;
+    login)   cmd_login "$@" ;;
+    list|ls) cmd_list ;;
+    delete|rm|del) cmd_delete "$@" ;;
+    rename|mv)     cmd_rename "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) die "Unknown subcommand: $cmd (see: ccm help)" ;;
+  esac
+}
+main "$@"
